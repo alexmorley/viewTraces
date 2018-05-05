@@ -1,0 +1,569 @@
+#!/home/data/.python_virtual_environments/ridge/bin/python2.7
+# Allows the executable to run on RIDGE, our python virtual env
+
+# GUI For displaying rasters and arbitrary binary data
+# By Alex & Vitor
+
+# Get command line arguments
+import argparse
+parser = argparse.ArgumentParser(
+    description='GUI For displaying rasters and arbitrary binary data')
+parser.add_argument('baseSession', type=str,
+                    help='The session base name to read the spike times from \
+        for arbitrary timestamps for now you can make fake res/clu and give this name')
+parser.add_argument('dataFile', type=str, help='Arbitrary binary data [int 16]')
+parser.add_argument('resolution', type=int, help='Sampling Rate of binary data in us',
+        default=-1, nargs='?')
+parser.add_argument('nch', type=int,
+                    help='Number of channels in binary data', default=-1, nargs='?')
+parser.add_argument('-o', '--orderFile', type=str, default = 'empty', help='Which cells to\
+        display and in which order [single column text file]')
+parser.add_argument('-m', '--memberFile', type=str, default = 'empty', help='Which cells to\
+        display a different color [single column text file]')
+parser.add_argument('-s', '--startPoint', type=int, default=0,
+                    help='which sample to start plotting from')
+parser.add_argument('-t', '--ttlPulse', type=str, default = 'empty', help='Also a TTL pulse\
+        as another (the last) channel')
+
+args = parser.parse_args()
+
+# Load in any required libraries
+# Plotting functions
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2TkAgg
+from matplotlib.figure import Figure
+import matplotlib.pylab as plt
+plt.rcParams['svg.fonttype'] = 'none'
+import vPlotFunctions as vp
+
+# Tkinter - For GUI
+import Tkinter as tk
+import tkFileDialog as tkf
+import tkMessageBox as tkmb
+
+# Math
+import vBaseFunctions as vbf
+import pandas as pd
+import numpy as np
+import os as os
+
+# For Config File
+import json
+
+# Loads any of the data and returns a memory-map object
+def loadData(baseSession, textFile, memberFile, dataFile, ttlPulse, nch, resolution):
+
+    resolution = resolution / 1000000. # microseconds
+    fs = 1. / resolution
+
+    res, clu = vbf.LoadSpikeTimes(baseSession, res2eeg=(fs / 20000))
+    if textFile != 'empty': 
+        cellOrder = pd.read_csv(textFile, squeeze=True).values
+        np.insert(cellOrder,0,1)
+    else:
+        cellOrder = np.unique(clu)
+    cellOrder = np.flip(cellOrder,0)
+    
+    if memberFile != 'empty':
+        cellMembers = pd.read_csv(memberFile, squeeze=True).values
+    else:
+        cellMembers = []
+
+    if ttlPulse != 'empty':
+        ttl = pd.read_csv(ttlPulse).values 
+    else:
+        ttl = np.zeros(1, int)
+
+    dtype = np.int16
+    order = 'F'
+
+    # Calculate the total number of data points in the provided binary-file
+    size = os.path.getsize(dataFile)
+    size = size / np.dtype(dtype).itemsize
+    nsamples = size / nch
+
+    # Create and return the 2D memory-map object
+    data = np.memmap(dataFile, mode='r', dtype=dtype,
+                     order=order, shape=(nch, size / nch))
+    timeaxis = 1000 * np.arange(0, nsamples) / fs
+
+    return timeaxis, data, res, clu, ttl, cellOrder, cellMembers, fs
+
+# Def of main GUI function
+
+
+class graphPage(tk.Frame):
+
+    def __init__(self, master):
+
+        master.columnconfigure(0, weight=1)
+        master.rowconfigure(0, weight=1)
+
+        # Auto-detect known file-extensions
+       	chaninds =  range(0,10)
+        self.chanorder = [False]
+        try:
+            self.par = vbf.LoadPar(os.getcwd()+'/'+args.baseSession.split('_')[0])
+            f,ext = os.path.splitext(args.dataFile)
+            if ext == '.eeg':
+                args.resolution = 800
+                args.nch = self.par['nch']
+                chaninds = [c[0] for c in self.par['trode_ch']]
+                self.chanorder = np.argsort(np.argsort(chaninds)) 
+	except:
+	    pass         
+        
+        if args.resolution == -1 | args.nch == -1:
+            raise ValueError('resolution or number of channels not provided and could not be inferred')
+        #print chaninds
+        # Load in initial data
+        self.timeaxis, self.data, self.res, self.clu, self.ttl, self.cellOrder, self.cellMembers, self.fs = loadData(
+            args.baseSession, args.orderFile, args.memberFile, args.dataFile, args.ttlPulse, args.nch, args.resolution)
+
+        tk.Frame.__init__(self, master)
+
+        # Menubars left -> right
+        self.menubar = tk.Menu(root, tearoff=1)
+        self.menubar.add_command(
+            label='Update plot', command=lambda: self.updatePlot())
+        self.menubar.add_command(label='Select channels',
+                                 command=lambda: self.makeChkBox(master))
+
+        # Navigation
+        self.menubar.add_command(
+            label='Backward', command=lambda: self.moveL())
+        self.menubar.add_command(
+            label='Forward', command=lambda: self.moveR())
+        self.menubar.add_command(
+            label='Zoom out', command=lambda: self.moreSamp())
+        self.menubar.add_command(
+            label='Zoom in', command=lambda: self.lessSamp())
+        self.menubar.add_command(
+            label='Go to', command=lambda: self.goto())
+        self.menubar.add_command(
+            label='Change # of samples', command=lambda: self.chstep())
+
+        # Loading/Saving
+        self.menubar.add_command(
+            label='Save Config', command=lambda: self.saveConfig())
+        self.menubar.add_command(
+            label='Load Config', command=lambda: self.readConfig())
+        self.menubar.add_command(
+            label='Save SVG', command=lambda: self.saveSVG())
+
+        root.config(menu=self.menubar)
+
+        # Initialise some variables
+        self.chans = np.zeros(args.nch, bool)
+        if len(self.ttl) > 1:
+            self.chans = np.append(self.chans, np.zeros(1, bool)) 
+	
+        self.chans[chaninds] = True
+        self.counter = 0
+        self.varar = [tk.BooleanVar() for x in range(len(self.chans))]
+        self.interval = [args.startPoint, int(self.fs)]
+        self.intsize = self.interval[1] - self.interval[0]
+
+        def leftKey(event):
+            self.moveL()
+
+        def rightKey(event):
+            self.moveR()
+
+        def downKey(event):
+            self.moreSamp()
+
+        def upKey(event):
+            self.lessSamp()
+
+        master.bind('<Left>', leftKey)
+        master.bind('<Right>', rightKey)
+        master.bind('<Up>', upKey)
+        master.bind('<Down>', downKey)
+
+        self.updatePlot()
+
+    # Config File
+    # Structure
+    #
+    # Interval to plot e.g. [35490, 1750]
+    # Size of interval e.g. 33740
+    # Plot offsets e.g. [4424.0, 8848.0, 13272.0, 17696.0, 22120.0, ... ]
+    # Number of channels in total e.g. 20
+    # Channels to plot e.g. [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    def readConfig(self):
+        temp = tkf.askopenfile(defaultextension=".disp.conf",
+                               filetypes=(('Config File', '.disp.conf'), ('All files', '.*')))
+        if temp:
+            cfile = temp
+            config = json.load(cfile)
+            cfile.close()
+
+            # load interval
+            self.interval = config[0]
+            self.intsize = config[1]
+            self.plotOffsets = config[2]
+
+            self.chans = np.zeros(config[3], dtype="bool")
+            # load channels to plot
+            self.chans[config[4]] = True
+
+            # need to add channel positions here
+            self.updatePlot()
+
+    def saveConfig(self):
+        temp = tkf.asksaveasfilename(defaultextension=".disp.conf",
+                                     filetypes=(('Config File', '.disp.conf'), ('All files', '.*')))
+        if temp:
+            self.savename = temp
+            cfile = open(self.savename, 'w')
+            config = [self.interval]
+            config.append(self.intsize)
+            config.append(self.plotOffsets.tolist())
+            config.append(len(self.chans))
+            config.append(np.ndarray.tolist(np.where(self.chans)[0]))
+            json.dump(config, cfile)
+            cfile.close()
+    #"""
+    # Opens a box to choose a filename for saving an .svg file then saves
+    #"""
+    def saveSVG(self):
+
+        if hasattr(self, 'f'):
+
+            temp = tkf.asksaveasfilename(defaultextension=".svg",
+                                         filetypes=(('SVG files', '.svg'), ('All files', '.*')))
+
+            if temp:
+                self.savename = temp
+                self.f.savefig(self.savename, format='svg')
+
+                confirmation = tk.Toplevel()
+                confirmation.title('')
+                confirmation.geometry('500x55')
+                tk.Label(confirmation, text='Figure saved as \n' + self.savename,
+                         font=('Helvetica', 14)).pack()
+                tk.Button(confirmation, text='OK',
+                          command=lambda: confirmation.destroy()).pack()
+
+            else:
+                error = tk.Toplevel()
+                error.title('')
+                error.geometry('500x55')
+                tk.Label(error, text='No figure to save',
+                         font=('Helvetica', 14)).pack()
+                tk.Button(error, text='OK',
+                          command=lambda: error.destroy()) .pack()
+
+    #"""
+    # Refreshes plot using current parameters, canyed by many internal functions
+    # Currently also definition for hard button on toolbar
+    #"""
+    def updatePlot(self):
+        # check bounds
+        if (self.interval[0] < 0):
+            self.interval = [0, self.intsize]
+        reclen = len(self.data[0])
+        if (self.interval[1] > reclen):
+            self.interval = [reclen - self.intsize, reclen]
+
+        # if there's no plot there already then create one
+        if not(hasattr(self, 'canvas')):
+
+            self.f = Figure(figsize=(50, 20), dpi=100, facecolor='white')
+            self.subplot_continuous = self.f.add_subplot(212)
+            self.subplot_raster = self.f.add_subplot(211)
+
+            self.canvas = FigureCanvasTkAgg(self.f, self)
+            self.canvas.get_tk_widget().pack(side='right', fill=tk.BOTH, expand=True)
+
+        if (np.sum(self.chans) > 0) | True:
+            self.plotContinuousData()
+
+        self.plotRaster()
+
+        def onclick(event):
+
+            if event.ydata is not None:
+                # print('button=%d, x=%d, y=%d, xdata=%f, ydata=%f' %
+                #          (event.button, event.x, event.y, event.xdata, event.ydata))
+
+                if event.button == 1:
+
+                    for chPlotIndex in range(len(self.chFigHandle)):
+                        plt.setp(self.chFigHandle[chPlotIndex], linewidth=1)
+
+                        chPlotIndex = np.argmin(
+                            np.abs(self.plotOffsets - event.ydata))
+                        plt.setp(self.chFigHandle[chPlotIndex], linewidth=2)
+
+                if event.button == 3:
+
+                    for chPlotIndex in range(len(self.chFigHandle)):
+
+                        line = self.chFigHandle[chPlotIndex]
+
+                        if plt.getp(line[0], 'linewidth') > 1:
+
+                            color = self.chColors[chPlotIndex]
+
+                            self.plotOffsets[chPlotIndex] = event.ydata
+                            self.chFigHandle[
+                                chPlotIndex].pop(0).remove()
+
+                            samples2plot = range(
+                                np.min(self.interval), np.max(self.interval))
+                            plot_timeaxis = self.timeaxis[samples2plot]
+
+                            chi = self.chs2plot[chPlotIndex]
+                            if self.plotttl == True and chi == len(self.chans)-1:
+                                relttl = self.ttl-samples2plot[1]
+                                plot_data = np.zeros(len(samples2plot), float)
+                                between = relttl[:][np.where([any((relttl >= 0)[:][x])
+                                    for x in range(np.shape(self.ttl)[1])])]
+                                if len(between) > 0:
+                                    for i in range(np.shape(between)[1]):
+                                        plot_data[between[i][0]:between[i][1]] = 10000
+                            else:
+                                plot_data = np.array(
+                                    self.data[chi, samples2plot]).astype(float)
+                            plot_data = plot_data + \
+                                self.plotOffsets[chPlotIndex]
+
+                            self.chFigHandle[chPlotIndex] = self.subplot_continuous.plot(
+                                plot_timeaxis,                                                                            plot_data, color=color)
+
+            self.canvas.show()
+
+        self.canvas.mpl_connect('button_press_event', onclick)
+        self.canvas.show()
+
+    def dataLimFromContinuousPanel(self):
+
+        n = len(self.subplot_continuous.get_lines())
+
+        if n > 0:
+            auxmax = np.max(
+                [np.max(self.subplot_continuous.get_lines()[i].get_ydata()) for i in range(n)])
+            auxmin = np.min(
+                [np.min(self.subplot_continuous.get_lines()[i].get_ydata()) for i in range(n)])
+        else:
+            auxmax = 0
+            auxmin = 0
+
+        return auxmin, auxmax
+
+    def plotRaster(self):
+
+        cellcnt = 0
+        #cellMembers = [32,21,88,12]
+        for cell in self.cellOrder: 
+            cellcnt += 1
+            aux = self.res[self.clu == cell]
+            aux = aux[(aux > np.min(self.interval)) &
+                      (aux < np.max(self.interval))]
+            aux = 1000 * aux / self.fs
+            if cell in self.cellMembers:
+                tickcol = "r"
+            else:
+                tickcol = "k"
+            self.subplot_raster.vlines(
+                aux, cellcnt, cellcnt + 1, linewidth=2, color=tickcol)
+
+        samples2plot = range(np.min(self.interval), np.max(self.interval))
+        self.subplot_raster.set_xlim(np.min(self.timeaxis[
+                                     samples2plot]),                                             np.max(self.timeaxis[samples2plot]))
+
+        self.subplot_raster.set_ylim(0, cellcnt + 2)
+        self.subplot_raster.axes.get_xaxis().set_visible(False)
+        self.subplot_raster.set_yticks(np.arange(1.5,cellcnt+1,1))
+        self.subplot_raster.set_yticklabels(self.cellOrder,size=6)
+
+    def plotContinuousData(self):
+
+        if hasattr(self, 'plotOffsets'):
+            plotOffsets = np.copy(self.plotOffsets)
+            chs2plot = np.copy(self.chs2plot)
+        else:
+            chs2plot = [None]
+
+        self.subplot_continuous.clear()
+
+        samples2plot = range(np.min(self.interval), np.max(self.interval))
+        plot_timeaxis = self.timeaxis[samples2plot]
+        
+        self.plotttl = False
+        if len(self.ttl) > 1:
+            self.plotttl = self.chans[-1]
+        self.chs2plot = np.where(self.chans)[0]
+       
+
+        self.plotOffsets = np.zeros(len(self.chs2plot))
+        self.chFigHandle = [None] * len(self.chs2plot)
+        self.chColors = plt.get_cmap('brg')(
+            np.linspace(1, 0, len(self.chs2plot)))
+
+        offsetStep = 0
+        for aux in self.data[self.chs2plot[:-1]]:
+            offsetStep = np.max(
+                (offsetStep, np.abs(np.diff(np.percentile(aux, [5, 95])))))
+
+        datacount = -1
+
+        self.chs2plot = self.chs2plot[self.chanorder][-1::-1] if len(self.chanorder) > 1 else self.chs2plot
+        self.chanorder = [False]
+        for chi in self.chs2plot:
+
+            datacount += 1
+
+            if chi in chs2plot:
+                self.plotOffsets[datacount] = plotOffsets[
+                    chi == chs2plot]
+            else:
+                self.plotOffsets[datacount] = np.max(
+                    self.plotOffsets) + offsetStep
+            if self.plotttl == True and chi == len(self.chans)-1:
+                relttl = self.ttl-samples2plot[1]
+                plot_data = np.zeros(len(samples2plot), float)
+                between = relttl[:][np.where([any((relttl >= 0)[:][x])
+                    for x in range(np.shape(self.ttl)[1])])]
+                if len(between) > 0: 
+                    for i in range(np.shape(between)[1]):
+                        plot_data[between[i][0]:between[i][1]] = 10000
+            else:
+                plot_data = np.array(
+                    self.data[chi, samples2plot]).astype(float)
+            self.chFigHandle[datacount] = self.subplot_continuous.plot(plot_timeaxis,
+                    plot_data + self.plotOffsets[datacount], color=self.chColors[datacount],
+                    label=chi)
+            self.subplot_continuous.legend()
+
+        self.subplot_continuous.set_xlim(
+            np.min(plot_timeaxis), np.max(plot_timeaxis))
+        self.subplot_continuous.tick_params(direction='out')
+        self.subplot_continuous.spines['top'].set_visible(False)
+        self.subplot_continuous.spines['right'].set_visible(False)
+        self.subplot_continuous.spines['left'].set_visible(False)
+        self.subplot_continuous.yaxis.set_major_locator(plt.NullLocator())
+        self.subplot_continuous.xaxis.set_ticks_position('bottom')
+        self.subplot_continuous.set_xlabel('Time (ms)', fontsize=13)
+
+        self.subplot_continuous.set_ylim(self.dataLimFromContinuousPanel())
+
+    def create_window(self, win_title):
+        self.counter += 1
+        t = tk.Toplevel(self)
+        t.wm_title(win_title)
+        return t
+
+    def pchan(self, x):
+        self.chans[x] = not self.chans[x]
+
+    def makeChkBox(self, master):
+
+        columns = 10
+        rows = 10
+
+        W = self.create_window('Select Channels')
+
+        for x in range(rows):
+            for y in range(columns):
+                chan = (columns * x) + y
+                if chan > len(self.chans) - 1:
+                    continue
+
+                a = tk.Checkbutton(W, text=str(chan), indicatoron=0,
+                                   variable=self.varar[chan], command=lambda chan=chan: self.pchan(chan))
+
+                a.grid(row=x, column=y)
+                if self.chans[chan]:
+                    a.select()
+
+        def on_closing():
+            W.destroy()
+            self.updatePlot()
+
+        W.protocol("WM_DELETE_WINDOW", on_closing)
+
+    def moveR(self):
+        self.interval = [x + self.intsize for x in self.interval]
+        self.updatePlot()
+
+    def moveL(self):
+        self.interval = [x - self.intsize for x in self.interval]
+        self.updatePlot()
+
+    def moreSamp(self):
+        self.intsize = self.intsize + 500
+        aux = int(np.mean(self.interval))
+        self.interval = [aux - self.intsize / 2, aux + self.intsize / 2]
+        self.updatePlot()
+
+    def lessSamp(self):
+        if self.intsize > 500:
+            self.intsize = self.intsize - 500
+            aux = int(np.mean(self.interval))
+            self.interval = [aux + self.intsize / 2, aux - self.intsize / 2]
+            self.updatePlot()
+
+    def goto(self):
+        W = self.create_window("GOTO")
+        tk.Label(W, text="t").pack(side="left")
+        content = tk.StringVar() # intialise string content
+        content.set(self.interval[0]) # set starting value to current position
+        text = tk.Entry(W, textvariable=content)
+        text.pack(side="left")
+
+        def goto_close():
+            t_start = text.get() or self.interval[0]
+            int_start = (len(self.timeaxis)-self.intsize) if (t_start=="end") else int(t_start)
+            self.interval = [int_start, int_start + self.intsize]
+            self.updatePlot()
+
+        def leave_goto(event):
+            goto_close()
+
+        but = tk.Button(W, text="OK", command=goto_close)
+        but.pack(side="right")
+
+        W.bind('<Return>', leave_goto)
+
+    def chstep(self):
+
+        W = self.create_window("Number of Samples to Plot:")
+        tk.Label(W, text="Number of Samples to Plot:").pack(side="left")
+        tk.Label(W, text='current value: ' +
+                 str(self.intsize)).pack(side="bottom")
+        content = tk.StringVar()
+        content.set(self.intsize)
+        text = tk.Entry(W, textvariable=content)
+        text.pack(side="left")
+
+        def chstep_close():
+            intsize = int(text.get() or self.intsize)
+            self.intsize = intsize
+            aux = int(np.mean(self.interval))
+            self.interval = [aux - intsize / 2, aux + intsize / 2]
+            self.updatePlot()
+            W.destroy()
+
+        def leave_chstep(event):
+            chstep_close()
+
+        but = tk.Button(W, text="OK", command=chstep_close)
+        but.pack(side="right")
+
+        W.bind('<Return>', leave_chstep)
+
+
+root = tk.Tk()
+root.title('First GUI')
+root.geometry('1000x500')
+root.configure(background='white')
+
+app = graphPage(root)
+app.grid()
+
+root.mainloop()
